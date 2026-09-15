@@ -1,0 +1,173 @@
+from itertools import chain
+import numpy as np
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LinearSVC
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.feature import StandardScaler, StringIndexer, VectorAssembler
+from pyspark.ml.functions import vector_to_array
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+from pyspark.sql import functions as F
+
+feature_names = ["A", "B", "C", "D", "E", "F"]
+
+# 1. Train / Validation Split FIRST (Prevents Data Leakage)
+data_trn_raw, data_val_raw = data.randomSplit(weights=[0.8, 0.2], seed=42)
+
+# 2. Pipeline: Assembler -> Scaler -> Label Indexer
+assembler = VectorAssembler(
+    inputCols=feature_names, outputCol="unscaled_features"
+)
+scaler = StandardScaler(
+    inputCol="unscaled_features",
+    outputCol="scaled_features",
+    withMean=True,
+    withStd=True,
+)
+label_indexer = StringIndexer(inputCol="label", outputCol="indexedLabel")
+
+pipeline = Pipeline(stages=[assembler, scaler, label_indexer])
+pipeline_model = pipeline.fit(data_trn_raw)
+
+data_trn = pipeline_model.transform(data_trn_raw).cache()
+data_val = pipeline_model.transform(data_val_raw).cache()
+
+# Materialize cache to prevent re-execution overhead
+data_trn.count()
+data_val.count()
+
+# Extract scaling mean and std for unscaling equation
+scaler_model = pipeline_model.stages[1]
+means = scaler_model.mean.toArray()
+stds = scaler_model.std.toArray()
+
+# 3. Compute Class Weights for Imbalance
+label_counts = data_trn.groupBy("indexedLabel").count().collect()
+total_rows = sum([row["count"] for row in label_counts])
+num_classes = len(label_counts)
+
+class_weights = {
+    row["indexedLabel"]: total_rows / (num_classes * row["count"])
+    for row in label_counts
+}
+mapping_expr = F.create_map([F.lit(x) for x in chain(*class_weights.items())])
+data_trn_weighted = data_trn.withColumn(
+    "weight", mapping_expr[F.col("indexedLabel")]
+)
+
+# 4. Hyperparameter Grid Search Setup (LinearSVC)
+l_svc = LinearSVC(
+    featuresCol="scaled_features",
+    labelCol="indexedLabel",
+    weightCol="weight",
+    maxIter=100,
+)
+
+evaluator = BinaryClassificationEvaluator(
+    labelCol="indexedLabel",
+    rawPredictionCol="rawPrediction",
+    metricName="areaUnderPR",
+)
+
+# Grid for Regularization (regParam) & Convergence Tolerance (tol)
+param_grid = (
+    ParamGridBuilder()
+    .addGrid(l_svc.regParam, [0.001, 0.01, 0.1, 1.0, 10.0])
+    .addGrid(l_svc.tol, [1e-6, 1e-4])
+    .build()
+)
+
+tvs = TrainValidationSplit(
+    estimator=l_svc,
+    estimatorParamMaps=param_grid,
+    evaluator=evaluator,
+    trainRatio=0.8,
+    seed=42,
+)
+
+# Fit grid search and select the best model
+tvs_model = tvs.fit(data_trn_weighted)
+best_svm_model = tvs_model.bestModel
+
+print("--- Best Hyperparameters Found ---")
+print(f"Optimal regParam: {best_svm_model.getRegParam()}")
+print(f"Optimal tol: {best_svm_model.getTol()}\n")
+
+# 5. Model Evaluation using the Best Model
+predictions = best_svm_model.transform(data_val)
+pr_auc = evaluator.evaluate(predictions)
+print(f"Validation PR-AUC (Best Model) = {pr_auc:.4f}")
+
+# 6. Unscale Coefficients Back to Raw Feature Space
+scaled_w = best_svm_model.coefficients.toArray()
+scaled_b = best_svm_model.intercept
+
+w_raw = scaled_w / stds
+b_raw = scaled_b - np.sum((scaled_w * means) / stds)
+
+print("\n--- Unscaled Raw SVM Parameters ---")
+print(f"Raw Bias (b*): {b_raw:.6f}")
+for name, w_val in zip(feature_names, w_raw):
+    print(f"  {name}: {w_val:.6f}")
+
+# 7. Single-Pass Optimal Threshold Search on Raw Predictions
+preds_with_score = predictions.withColumn(
+    "raw_score", vector_to_array(F.col("rawPrediction"))[1]
+)
+
+thresholds = [i / 10.0 for i in range(-20, 20)]  # Search margin space [-2.0, 1.9]
+exprs = []
+
+for t in thresholds:
+    tag = str(t).replace(".", "_").replace("-", "neg_")
+    exprs.extend(
+        [
+            F.sum(
+                F.when(
+                    (F.col("raw_score") >= t) & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"tp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("raw_score") >= t) & (F.col("indexedLabel") == 0.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("raw_score") < t) & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fn_{tag}"),
+        ]
+    )
+
+metrics_row = preds_with_score.agg(*exprs).collect()[0]
+
+best_f1 = -1.0
+best_threshold = 0.0
+
+for t in thresholds:
+    tag = str(t).replace(".", "_").replace("-", "neg_")
+    tp = metrics_row[f"tp_{tag}"] or 0
+    fp = metrics_row[f"fp_{tag}"] or 0
+    fn = metrics_row[f"fn_{tag}"] or 0
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = (
+        (2 * precision * recall) / (precision + recall)
+        if (precision + recall) > 0
+        else 0
+    )
+
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = t
+
+print(
+    f"\nOptimal Raw Threshold Found: {best_threshold:.2f} (Best Validation F1: {best_f1:.4f})"
+)
+
+data_trn.unpersist()
+data_val.unpersist()

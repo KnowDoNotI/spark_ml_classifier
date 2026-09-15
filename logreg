@@ -1,0 +1,213 @@
+from itertools import chain
+import numpy as np
+
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.feature import StandardScaler, StringIndexer, VectorAssembler
+from pyspark.ml.functions import vector_to_array
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+from pyspark.sql import functions as F
+
+feature_names = ["A", "B", "C", "D", "E", "F"]
+
+# 1. Split training/validation
+data_trn_raw, data_val_raw = data.randomSplit(weights=[0.8, 0.2], seed=42)
+
+# 2. Preprocessing Pipeline Definition
+assembler = VectorAssembler(
+    inputCols=feature_names, outputCol="unscaled_features"
+)
+
+scaler = StandardScaler(
+    inputCol="unscaled_features",
+    outputCol="features",
+    withMean=False,  # Set True for dense data
+    withStd=True,
+)
+
+label_indexer = StringIndexer(inputCol="label", outputCol="indexedLabel")
+
+preprocessing_pipeline = Pipeline(stages=[assembler, scaler, label_indexer])
+
+# Fit preprocessing on training data
+pipeline_model = preprocessing_pipeline.fit(data_trn_raw)
+data_trn = pipeline_model.transform(data_trn_raw)
+data_val = pipeline_model.transform(data_val_raw)
+
+# 3. 
+label_counts = data_trn.groupBy("indexedLabel").count().collect()
+total_rows = sum([row["count"] for row in label_counts])
+num_classes = len(label_counts)
+
+class_weights = {
+    row["indexedLabel"]: total_rows / (num_classes * row["count"])
+    for row in label_counts
+}
+
+mapping_expr = F.create_map([F.lit(x) for x in chain(*class_weights.items())])
+
+# Use bracket indexing instead of .getItem()
+data_trn_weighted = data_trn.withColumn(
+    "weight", mapping_expr[F.col("indexedLabel")]
+)
+
+# 4. Logistic Regression Estimator & Tuning
+
+lr = LogisticRegression(
+    featuresCol="features", labelCol="indexedLabel", weightCol="weight"
+)
+
+evaluator = BinaryClassificationEvaluator(
+    labelCol="indexedLabel",
+    rawPredictionCol="rawPrediction",
+    metricName="areaUnderPR",
+)
+
+paramGrid = (
+    ParamGridBuilder()
+    .addGrid(lr.regParam, [0.001, 0.01, 0.1, 1.0])
+    .addGrid(lr.maxIter, [10, 20, 50])
+    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+    .build()
+)
+
+tvs = TrainValidationSplit(
+    estimator=lr,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    trainRatio=0.8,
+    seed=42,
+)
+
+tvs_model = tvs.fit(data_trn_weighted)
+best_tvs_model = tvs_model.bestModel
+
+# 5. Model Evaluation 
+predictions = best_tvs_model.transform(data_val)
+pr_auc = evaluator.evaluate(predictions)
+print(f"Area Under Precision-Recall Curve (PR-AUC) = {pr_auc:.4f}")
+
+# Error Analysis (Missed Positives)
+missed_positives = predictions.filter(
+    (F.col("indexedLabel") == 1.0) & (F.col("prediction") == 0.0)
+).count()
+
+total_actual_positives = predictions.filter(
+    F.col("indexedLabel") == 1.0
+).count()
+
+miss_rate = (
+    (missed_positives / total_actual_positives) * 100
+    if total_actual_positives > 0
+    else 0
+)
+
+print(f"Total Actual Positives: {total_actual_positives}")
+print(f"Missed Positives (False Negatives): {missed_positives}")
+print(f"Positive Miss Rate: {miss_rate:.2f}%\n")
+
+# 6. Extract Model Parameters
+best_reg_param = best_tvs_model.getRegParam()
+best_elastic_net = best_tvs_model.getElasticNetParam()
+best_max_iter = best_tvs_model.getMaxIter()
+
+print("--- Best Hyperparameters ---")
+print(f"Regularization Parameter (regParam): {best_reg_param}")
+print(f"ElasticNet Parameter (elasticNetParam): {best_elastic_net}")
+print(f"Max Iterations (maxIter): {best_max_iter}\n")
+
+# Extract Scaled Parameters
+coefficients = best_tvs_model.coefficients
+intercept = best_tvs_model.intercept
+
+print("--- Learned Parameters (Scaled Features) ---")
+print(f"Intercept: {intercept:.4f}")
+for name, coef in zip(feature_names, coefficients):
+    print(f"  {name}: {coef:.4f}")
+
+# 7. Convert Coefficients to Raw (Unscaled) Space
+scaler_model = pipeline_model.stages[1]  # Index 1 is StandardScaler
+stds = scaler_model.std
+means = (
+    scaler_model.mean
+    if (hasattr(scaler_model, "mean") and scaler_model.mean is not None)
+    else np.zeros(len(feature_names))
+)
+
+raw_coefs = [c / s if s != 0 else 0.0 for c, s in zip(coefficients, stds)]
+
+sum_term = sum(
+    (c * m) / s for c, m, s in zip(coefficients, means, stds) if s != 0
+)
+
+raw_intercept = intercept - sum_term
+
+print("\n--- Model Parameters (Raw / Unscaled Features) ---")
+print(f"Intercept (Raw): {raw_intercept:.4f}")
+for name, raw_c in zip(feature_names, raw_coefs):
+    print(f"  {name}: {raw_c:.4f}")
+
+# 8. Single-Pass Optimal Threshold Search (1 Spark Action)
+preds_with_prob = predictions.withColumn(
+    "prob_positive", vector_to_array(F.col("probability"))[1]
+)
+
+thresholds = [i / 20.0 for i in range(1, 20)]  # 0.05 to 0.95
+exprs = []
+
+for t in thresholds:
+    tag = str(t).replace(".", "_")
+    exprs.extend(
+        [
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") >= t)
+                    & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"tp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") >= t)
+                    & (F.col("indexedLabel") == 0.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") < t)
+                    & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fn_{tag}"),
+        ]
+    )
+
+# Executes single Spark aggregation job
+metrics_row = preds_with_prob.agg(*exprs).collect()[0]
+
+best_f1 = -1.0
+best_threshold = 0.5
+
+for t in thresholds:
+    tag = str(t).replace(".", "_")
+    tp = metrics_row[f"tp_{tag}"] or 0
+    fp = metrics_row[f"fp_{tag}"] or 0
+    fn = metrics_row[f"fn_{tag}"] or 0
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = (
+        (2 * precision * recall) / (precision + recall)
+        if (precision + recall) > 0
+        else 0
+    )
+
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = t
+
+print(
+    f"\nOptimal Threshold Found: {best_threshold:.2f} (Best Validation F1: {best_f1:.4f})"
+)

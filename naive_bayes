@@ -1,0 +1,186 @@
+from itertools import chain
+import numpy as np
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import NaiveBayes
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.feature import StandardScaler, StringIndexer, VectorAssembler
+from pyspark.ml.functions import vector_to_array
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+from pyspark.sql import functions as F
+
+feature_names = ["A", "B", "C", "D", "E", "F"]
+
+# 1. Train / Validation Split
+data_trn_raw, data_val_raw = data.randomSplit(weights=[0.8, 0.2], seed=42)
+
+# 2. Preprocessing Pipeline
+assembler = VectorAssembler(
+    inputCols=feature_names, outputCol="unscaled_features"
+)
+scaler = StandardScaler(
+    inputCol="unscaled_features",
+    outputCol="features",
+    withMean=False,
+    withStd=True,
+)
+label_indexer = StringIndexer(inputCol="label", outputCol="indexedLabel")
+
+preprocessing_pipeline = Pipeline(stages=[assembler, scaler, label_indexer])
+pipeline_model = preprocessing_pipeline.fit(data_trn_raw)
+
+data_trn = pipeline_model.transform(data_trn_raw)
+data_val = pipeline_model.transform(data_val_raw)
+
+# 3. Compute Class Weights
+label_counts = data_trn.groupBy("indexedLabel").count().collect()
+total_rows = sum([row["count"] for row in label_counts])
+num_classes = len(label_counts)
+
+class_weights = {
+    row["indexedLabel"]: total_rows / (num_classes * row["count"])
+    for row in label_counts
+}
+
+mapping_expr = F.create_map([F.lit(x) for x in chain(*class_weights.items())])
+data_trn_weighted = data_trn.withColumn(
+    "weight", mapping_expr[F.col("indexedLabel")]
+)
+
+# 4. Naive Bayes Estimator (Gaussian modelType for continuous features)
+nb = NaiveBayes(
+    featuresCol="features",
+    labelCol="indexedLabel",
+    weightCol="weight",
+    modelType="gaussian",
+)
+
+evaluator = BinaryClassificationEvaluator(
+    labelCol="indexedLabel",
+    rawPredictionCol="rawPrediction",
+    metricName="areaUnderPR",
+)
+
+# Grid search over variance smoothing values
+paramGrid = (
+    ParamGridBuilder()
+    .addGrid(nb.smoothing, [0.0, 0.1, 0.5, 1.0, 2.0])
+    .build()
+)
+
+tvs = TrainValidationSplit(
+    estimator=nb,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    trainRatio=0.8,
+    seed=42,
+)
+
+tvs_model = tvs.fit(data_trn_weighted)
+best_tvs_model = tvs_model.bestModel
+
+# 5. Model Evaluation on Validation Set
+predictions = best_tvs_model.transform(data_val)
+pr_auc = evaluator.evaluate(predictions)
+print(f"Area Under Precision-Recall Curve (PR-AUC) = {pr_auc:.4f}")
+
+# Error Analysis (Missed Positives)
+missed_positives = predictions.filter(
+    (F.col("indexedLabel") == 1.0) & (F.col("prediction") == 0.0)
+).count()
+
+total_actual_positives = predictions.filter(
+    F.col("indexedLabel") == 1.0
+).count()
+
+miss_rate = (
+    (missed_positives / total_actual_positives) * 100
+    if total_actual_positives > 0
+    else 0
+)
+
+print(f"Total Actual Positives: {total_actual_positives}")
+print(f"Missed Positives (False Negatives): {missed_positives}")
+print(f"Positive Miss Rate: {miss_rate:.2f}%\n")
+
+# 6. Extract Learned Naive Bayes Parameters
+best_smoothing = best_tvs_model.getSmoothing()
+best_model_type = best_tvs_model.getModelType()
+
+print("--- Best Hyperparameters ---")
+print(f"Model Type: {best_model_type}")
+print(f"Smoothing Parameter: {best_smoothing}\n")
+
+# Extract Prior probabilities, Feature Means, and Feature Variances
+log_priors = best_tvs_model.pi
+means_matrix = best_tvs_model.theta
+variance_matrix = best_tvs_model.sigma
+
+print("--- Learned Naive Bayes Statistical Parameters ---")
+print(f"Log Class Priors (pi):\n  {log_priors}")
+print("Per-Class Feature Means (theta matrix):")
+print(f"  {means_matrix}")
+print("Per-Class Feature Variances (sigma matrix):")
+print(f"  {variance_matrix}")
+
+# 7. Single-Pass Optimal Threshold Search
+preds_with_prob = predictions.withColumn(
+    "prob_positive", vector_to_array(F.col("probability"))[1]
+)
+
+thresholds = [i / 20.0 for i in range(1, 20)]
+exprs = []
+
+for t in thresholds:
+    tag = str(t).replace(".", "_")
+    exprs.extend(
+        [
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") >= t)
+                    & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"tp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") >= t)
+                    & (F.col("indexedLabel") == 0.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fp_{tag}"),
+            F.sum(
+                F.when(
+                    (F.col("prob_positive") < t)
+                    & (F.col("indexedLabel") == 1.0),
+                    1,
+                ).otherwise(0)
+            ).alias(f"fn_{tag}"),
+        ]
+    )
+
+metrics_row = preds_with_prob.agg(*exprs).collect()[0]
+
+best_f1 = -1.0
+best_threshold = 0.5
+
+for t in thresholds:
+    tag = str(t).replace(".", "_")
+    tp = metrics_row[f"tp_{tag}"] or 0
+    fp = metrics_row[f"fp_{tag}"] or 0
+    fn = metrics_row[f"fn_{tag}"] or 0
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = (
+        (2 * precision * recall) / (precision + recall)
+        if (precision + recall) > 0
+        else 0
+    )
+
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = t
+
+print(
+    f"\nOptimal Threshold Found: {best_threshold:.2f} (Best Validation F1: {best_f1:.4f})"
+)
